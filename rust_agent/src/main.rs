@@ -1,7 +1,7 @@
-use std::env;
-use log::{info, error};
-use env_logger;
+use log::info;
+mod config; 
 use actix_web::{get, App, HttpServer, Responder};
+use crate::config::Config;
 
 /// Simple health check route
 #[get("/health")]
@@ -15,19 +15,15 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     info!("Starting Live Translator...");
 
-    // Read port from env or default
-    let port = env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
+    let cfg = Config::from_env();
 
-    info!("HTTP server listening on 127.0.0.1:{}", port);
+    info!("HTTP server listening on 127.0.0.1:{}", cfg.port);
 
     HttpServer::new(|| {
         App::new()
             .service(health) // just /health endpoint for now
     })
-    .bind(("127.0.0.1", port))?
+    .bind(("127.0.0.1", cfg.port))?
     .run()
     .await
 }
