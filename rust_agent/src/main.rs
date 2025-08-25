@@ -4,6 +4,9 @@ use actix_web::http::header;
 use tokio::time::{sleep, Duration};
 use std::convert::Infallible;
 use actix_web::web::Bytes;
+use actix_cors::Cors;
+use futures_util::{stream, StreamExt};
+use tokio_stream::wrappers::IntervalStream;
 
 mod config;
 mod state;
@@ -78,12 +81,37 @@ async fn stream_raw(app: web::Data<AppState>) -> impl Responder {
         }
     });
 
+    // comment keepalive frames every 15s
+    let ka = IntervalStream::new(tokio::time::interval(Duration::from_secs(15)))
+        .map(|_| Ok::<Bytes, Infallible>(Bytes::from_static(b": keepalive\n\n")));
+
+    // merge both streams
+    let merged = stream::select(stream, ka);
+
 
     HttpResponse::Ok()
         .insert_header((header::CONTENT_TYPE, "text/event-stream"))
         .insert_header((header::CACHE_CONTROL, "no-cache"))
-        .streaming(stream)
+        .insert_header((header::CONNECTION, "keep-alive"))
+        .streaming(merged)
 }
+
+#[get("/debug/sse")]
+async fn debug_sse() -> impl Responder {
+    let ticks = IntervalStream::new(tokio::time::interval(Duration::from_millis(500)))
+        .enumerate()
+        .map(|(i, _)| {
+            let frame = format!("data: {{\"tick\":{}}}\n\n", i);
+            Ok::<Bytes, Infallible>(Bytes::from(frame))
+        });
+
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, "text/event-stream"))
+        .insert_header((header::CACHE_CONTROL, "no-cache"))
+        .insert_header((header::CONNECTION, "keep-alive"))
+        .streaming(ticks)
+}
+
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -100,10 +128,12 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(shared.clone()) // provide AppState to handlers
+            .wrap(Cors::permissive()) // allow any origin for quick testing
             .service(health) 
             .service(start)            
             .service(stop)             
-            .service(stream_raw)       
+            .service(stream_raw)
+            .service(debug_sse)
     })
     .bind(("127.0.0.1", cfg.port))?
     .run()
