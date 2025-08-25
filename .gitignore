@@ -1,0 +1,100 @@
+# ===============================
+# Rust
+# ===============================
+/target/
+/Cargo.lock
+**/*.rs.bk
+
+# ===============================
+# Java (Maven / Gradle / IntelliJ / Eclipse)
+# ===============================
+# Build dirs
+java_api/target/
+java_api/build/
+.java/
+.gradle/
+.classpath
+.project
+.settings/
+# IDE files
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# Logs
+*.log
+
+# ===============================
+# Python (venv + cache)
+# ===============================
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.python-version
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+.python_history
+
+# ===============================
+# Node.js / Frontend
+# ===============================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+package-lock.json
+yarn.lock
+dist/
+build/
+
+# ===============================
+# Audio / Models / Large Data
+# ===============================
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.opus
+*.aac
+*.m4a
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Whisper/XTTS models=
+/whisper.cpp/models/
+/TTS/.models/
+/models/
+/checkpoints/
+/experiments/
+
+# ===============================
+# OS / Misc
+# ===============================
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+
+# ===============================
+# Env & Secrets
+# ===============================
+.env
+.env.*
+!.env.example
