@@ -9,6 +9,7 @@ use futures_util::{stream, StreamExt};
 use tokio_stream::wrappers::IntervalStream;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 mod config;
 mod state;
@@ -30,6 +31,10 @@ fn vad_rms_db(pcm: &[i16]) -> (bool, f32) {
     let db = if rms <= 1.0 { -90.0 } else { 20.0 * (rms / 32768.0).log10() as f32 };
     let is_voice = db > -45.0; // simple threshold
     (is_voice, db)
+}
+
+fn s16le_to_f32(pcm: &[i16]) -> Vec<f32> {
+    pcm.iter().map(|&s| (s as f32) / 32768.0).collect()
 }
 
 fn device_arg(format: &str, device: &str) -> String {
@@ -61,10 +66,13 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
     cfg.ffmpeg_device.clone(),
     cfg.sample_rate,
     cfg.chunk_ms,
+    cfg.whisper_model.clone(),
+    cfg.whisper_threads,
     );
+    
     // Mock producer
     let handle = tokio::spawn(async move {
-        let (tx, mut stop_rx, ffmpeg, format, device, sr, chunk_ms) = cfg_ffmpeg;
+        let (tx, mut stop_rx, ffmpeg, format, device, sr, chunk_ms, whisper_model, whisper_threads) = cfg_ffmpeg;
 
         // ---- ffmpeg command: microphone -> mono s16le @ sr Hz -> stdout ----
         let dev = device_arg(&format, &device);
@@ -92,6 +100,19 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
         let samples_per_chunk = (sr as u64 * chunk_ms as u64 / 1000) as usize;
         let bytes_per_chunk = samples_per_chunk * bytes_per_sample;
 
+        // ---- whisper init (load once per /start) ----
+        let wctx = match WhisperContext::new_with_params(
+        &whisper_model,
+        WhisperContextParameters::default()
+         ) {
+            Ok(c) => c,
+            Err(e) => { let _ = tx.send(format!(r#"{{"error":"load whisper","msg":"{}"}}"#, e)); return; }
+        };
+        let mut wstate = match wctx.create_state() {
+            Ok(s) => s,
+            Err(e) => { let _ = tx.send(format!(r#"{{"error":"whisper state","msg":"{}"}}"#, e)); return; }
+        };
+
         let mut buf = vec![0u8; bytes_per_chunk];
         let mut t: f32 = 0.0;
         loop {
@@ -109,6 +130,44 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
                 // simple VAD + dBFS
                 let (is_voice, db) = vad_rms_db(&pcm);
 
+                // --- run whisper on this chunk if voice is active ---
+                let mut text_out = String::new();
+                if is_voice {
+                    let pcm_f32 = s16le_to_f32(&pcm);
+                    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+                    params.set_n_threads(whisper_threads as i32);
+                    params.set_translate(false);
+                    params.set_language(Some("auto"));
+                    params.set_no_timestamps(true);
+                    params.set_print_special(false);
+                    params.set_print_progress(false);
+                    params.set_print_realtime(false);
+                    params.set_no_context(true);
+                    params.set_single_segment(true);
+                    params.set_temperature(0.0);
+                    params.set_max_len(64);
+
+                    if let Err(e) = wstate.full(params, &pcm_f32) {
+                        let _ = tx.send(format!(r#"{{"error":"whisper full","msg":"{}"}}"#, e));
+                    } else {
+                        let n = wstate.full_n_segments().unwrap_or(0);
+                        for i in 0..n {
+                            if let Ok(seg) = wstate.full_get_segment_text(i) {
+                                text_out.push_str(&seg);
+                            }
+                        }
+                        text_out = text_out.trim().to_string();
+                    }
+                }
+
+                if !text_out.is_empty() {
+                    let t1 = t + (samples_per_chunk as f32 / sr as f32);
+                    let lang = "und"; // TODO: wire up language detection later
+                    let _ = tx.send(format!(
+                        r#"{{"t0":{:.2},"t1":{:.2},"text":"{}","lang":"{}"}}"#,
+                        t, t1, text_out.replace('"', "\\\""), lang
+                    ));
+                }
 
             // emit one frame
             let _ = tx.send(format!(

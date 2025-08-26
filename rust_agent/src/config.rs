@@ -9,6 +9,8 @@ pub struct Config {
     pub ffmpeg_device: String,
     pub sample_rate: u32,
     pub chunk_ms: u32,
+    pub whisper_model: String,
+    pub whisper_threads: usize,
 
 }
 
@@ -32,6 +34,10 @@ impl Config {
         // audio params
         let sample_rate = env::var("SAMPLE_RATE").ok().and_then(|s| s.parse().ok()).unwrap_or(16_000);
         let chunk_ms    = env::var("CHUNK_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+        let whisper_model = env::var("WHISPER_MODEL")
+            .unwrap_or_else(|_| "./models/ggml-base.en.bin".to_string());
+        let whisper_threads = env::var("WHISPER_THREADS").ok().and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| num_cpus::get().max(1));
 
         Self { 
             port,
@@ -40,6 +46,8 @@ impl Config {
             ffmpeg_device,
             sample_rate,
             chunk_ms,
+            whisper_model, 
+            whisper_threads,
         }
     }
 }
