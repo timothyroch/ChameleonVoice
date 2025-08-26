@@ -11,6 +11,7 @@ pub struct Config {
     pub chunk_ms: u32,
     pub whisper_model: String,
     pub whisper_threads: usize,
+    pub translate_base: String,
 
 }
 
@@ -39,6 +40,10 @@ impl Config {
         let whisper_threads = env::var("WHISPER_THREADS").ok().and_then(|s| s.parse().ok())
             .unwrap_or_else(|| num_cpus::get().max(1));
 
+        // translation
+        let translate_base = env::var("TRANSLATE_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:5000".to_string());
+
         Self { 
             port,
             ffmpeg,
@@ -48,6 +53,7 @@ impl Config {
             chunk_ms,
             whisper_model, 
             whisper_threads,
+            translate_base,
         }
     }
 }

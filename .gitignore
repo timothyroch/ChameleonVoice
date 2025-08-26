@@ -57,6 +57,7 @@ package-lock.json
 yarn.lock
 dist/
 build/
+db/
 
 # ===============================
 # Audio / Models / Large Data

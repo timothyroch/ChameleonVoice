@@ -10,6 +10,8 @@ use tokio_stream::wrappers::IntervalStream;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use reqwest::Client;
+use serde_json::{Value as Json, json};
 
 mod config;
 mod state;
@@ -44,6 +46,22 @@ fn device_arg(format: &str, device: &str) -> String {
         format!(":{}", device)
     } else {
         device.to_string()
+    }
+}
+
+async fn translate_text(http: &Client, base: &str, text: &str, to: &str) -> String {
+    if text.trim().is_empty() { return String::new(); }
+    let url = format!("{}/translate", base.trim_end_matches('/'));
+    let body = json!({ "q": text, "source":"auto", "target": to });
+
+    match http.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<Json>().await {
+                Ok(j) => j.get("translatedText").and_then(|v| v.as_str()).unwrap_or(text).to_string(),
+                Err(_) => text.to_string(),
+            }
+        }
+        _ => text.to_string(), // fail-open so SSE keeps flowing
     }
 }
 
@@ -237,6 +255,56 @@ async fn stream_raw(app: web::Data<AppState>) -> impl Responder {
         .streaming(merged)
 }
 
+#[get("/stream/translated")]
+async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to: web::Query<std::collections::HashMap<String,String>>) -> impl Responder {
+    let rx = app.tx.subscribe();
+    let target = to.get("to").map(|s| s.as_str()).unwrap_or("en").to_string();
+
+    let http = Client::new();
+    let base = cfg.translate_base.clone();
+
+    // Transform incoming JSON lines: translate "text" when present
+    let stream = futures_util::stream::unfold((rx, http, base, target), |(mut rx, http, base, target)| async move {
+        match rx.recv().await {
+            Ok(line) => {
+                // parse JSON object; if it has "text", translate it
+                let mut out_line = line.clone();
+                if let Ok(mut node) = serde_json::from_str::<Json>(&line) {
+                    if node.is_object() {
+                        if let Some(text) = node.get("text").and_then(|v| v.as_str()) {
+                            if !text.trim().is_empty() {
+                                let tr = translate_text(&http, &base, text, &target).await;
+                                if let Some(obj) = node.as_object_mut() {
+                                    obj.insert("text".into(), Json::String(tr));
+                                }
+                                out_line = node.to_string();
+                            }
+                        } else {
+                            // pass-through any non-text JSON from worker (e.g., VU frames)
+                            out_line = node.to_string();
+                        }
+                    }
+                }
+                let frame = format!("data: {}\n\n", out_line);
+                Some((Ok::<Bytes, Infallible>(Bytes::from(frame)), (rx, http, base, target)))
+            }
+            Err(_) => None,
+        }
+    });
+
+    // keepalive comments every 15s
+    let ka = IntervalStream::new(tokio::time::interval(Duration::from_secs(15)))
+        .map(|_| Ok::<Bytes, Infallible>(Bytes::from_static(b": keepalive\n\n")));
+
+    let merged = stream::select(stream, ka);
+
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, "text/event-stream"))
+        .insert_header((header::CACHE_CONTROL, "no-cache"))
+        .insert_header((header::CONNECTION, "keep-alive"))
+        .streaming(merged)
+}
+
 #[get("/debug/sse")]
 async fn debug_sse() -> impl Responder {
     let ticks = IntervalStream::new(tokio::time::interval(Duration::from_millis(500)))
@@ -278,6 +346,7 @@ async fn main() -> std::io::Result<()> {
             .service(stop)             
             .service(stream_raw)
             .service(debug_sse)
+            .service(stream_translated)
     })
     .bind(("127.0.0.1", cfg.port))?
     .run()
