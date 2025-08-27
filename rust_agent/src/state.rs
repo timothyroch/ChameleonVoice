@@ -1,11 +1,14 @@
-use tokio::sync::{broadcast, watch};
+use std::collections::VecDeque;
+use std::sync::Arc;
+use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
 
 /// Shared app state for SSE + background worker
 pub struct AppState {
     pub tx: broadcast::Sender<String>,                 
     pub worker: tokio::sync::Mutex<Option<JoinHandle<()>>>, 
-    pub stop_tx: watch::Sender<bool>,                  
+    pub stop_tx: watch::Sender<bool>,  
+    pub speaker_buf: Arc<Mutex<VecDeque<i16>>>,                
 }
 
 impl AppState {
@@ -20,6 +23,7 @@ impl AppState {
             tx,
             worker: tokio::sync::Mutex::new(None),
             stop_tx,
+            speaker_buf: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 }

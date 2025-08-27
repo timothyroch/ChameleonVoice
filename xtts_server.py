@@ -5,6 +5,8 @@ from typing import Optional, List
 import numpy as np
 import wave
 import io
+import os, requests
+import tempfile
 
 try:
     from TTS.api import TTS
@@ -27,7 +29,8 @@ except Exception as e:
 class TTSRequest(BaseModel):
     text: str
     language: Optional[str] = "en"   
-    speaker: Optional[str] = None     
+    speaker: Optional[str] = None
+    speaker_wav: Optional[str] = None     
     audio_format: Optional[str] = "wav"  
 
 def clean_and_chunk(text: str, max_len: int = 220) -> List[str]:
@@ -67,24 +70,68 @@ def to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
         wf.writeframes(pcm16.tobytes())
     return buf.getvalue()
 
+def _load_wav_bytes(ref: str) -> bytes | None:
+    try:
+        if ref.startswith("http://") or ref.startswith("https://"):
+            r = requests.get(ref, timeout=10)
+            r.raise_for_status()
+            return r.content
+        if os.path.exists(ref):
+            with open(ref, "rb") as f:
+                return f.read()
+    except Exception:
+        return None
+    return None
+
+def _resolve_speaker_wav_path(ref: Optional[str]) -> Optional[str]:
+    """
+    Return a local filesystem path to a WAV file.
+    - If ref is a local path, return it (if it exists).
+    - If ref is a URL, download to a temp .wav and return that path.
+    - Else, return None.
+    """
+    if not ref:
+        return None
+    ref = ref.strip()
+    try:
+        if ref.startswith("http://") or ref.startswith("https://"):
+            r = requests.get(ref, timeout=15)
+            r.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(prefix="spk_", suffix=".wav", delete=False)
+            tmp.write(r.content)
+            tmp.flush(); tmp.close()
+            return tmp.name
+        if os.path.exists(ref):
+            return ref
+    except Exception:
+        return None
+    return None
+
 @app.post("/tts")
 def synthesize(req: TTSRequest):
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
-    lang = (req.language or "en").strip()
+    lang = (req.language or "en").strip().lower()
     speaker = req.speaker  # can be None; XTTS v2 has internal defaults
+    spk_path = _resolve_speaker_wav_path(req.speaker_wav)
 
     chunks = clean_and_chunk(text)
     # Synthesize each chunk and simple-concatenate waveform
     waves = []
     try:
         for ch in chunks:
-            wav = tts.tts(text=ch, speaker=speaker, language=lang)  # returns numpy array (float32)
+            if spk_path is not None:
+                wav = tts.tts(text=ch, language=lang, speaker_wav=spk_path)
+            elif speaker:
+                wav = tts.tts(text=ch, language=lang, speaker=speaker)
+            else:
+                wav = tts.tts(text=ch, language=lang)
             waves.append(np.asarray(wav, dtype=np.float32))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS synthesis failed: {e}")
+        import traceback
+        raise HTTPException(status_code=500, detail=f"TTS synthesis failed: {e}\n{traceback.format_exc()}")
 
     if not waves:
         raise HTTPException(status_code=500, detail="No audio generated")

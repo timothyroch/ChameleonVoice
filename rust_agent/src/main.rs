@@ -12,6 +12,8 @@ use tokio::process::Command;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 use reqwest::Client;
 use serde_json::{Value as Json, json};
+use actix_web::HttpRequest;
+use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
 mod config;
 mod state;
@@ -31,7 +33,7 @@ fn vad_rms_db(pcm: &[i16]) -> (bool, f32) {
     let sum_sq: f64 = pcm.iter().map(|&s| (s as f64) * (s as f64)).sum();
     let rms = (sum_sq / pcm.len() as f64).sqrt();
     let db = if rms <= 1.0 { -90.0 } else { 20.0 * (rms / 32768.0).log10() as f32 };
-    let is_voice = db > -45.0; // simple threshold
+    let is_voice = db > -60.0; // simple threshold
     (is_voice, db)
 }
 
@@ -65,6 +67,38 @@ async fn translate_text(http: &Client, base: &str, text: &str, to: &str) -> Stri
     }
 }
 
+fn normalize_and_chunk(text: &str, max_len: usize) -> Vec<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let clean = text
+        .nfc()
+        .collect::<String>()
+        .chars()
+        .filter(|&c| !c.is_control() || c == '\n')
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    let mut out = Vec::new();
+    for piece in clean.split(|c: char| "。．.?!？！\n".contains(c)) {
+        let p = piece.trim();
+        if p.is_empty() { continue; }
+        if p.len() <= max_len {
+            out.push(p.to_string());
+        } else {
+            // safe fixed-size slices on char boundaries
+            let mut start_idx = 0;
+            while start_idx < p.len() {
+                let mut end = (start_idx + max_len).min(p.len());
+                while end < p.len() && !p.is_char_boundary(end) { end += 1; }
+                out.push(p[start_idx..end].to_string());
+                start_idx = end;
+            }
+        }
+    }
+    if out.is_empty() && !clean.is_empty() { out.push(clean); }
+    out
+}
+
 
 #[post("/start")]
 async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Responder {
@@ -74,6 +108,7 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
     // reset stop flag
     let _ = app.stop_tx.send(false);
     let tx = app.tx.clone();
+    let speaker_buf_handle = app.speaker_buf.clone();
 
     // capture the config values we need into the task
     let cfg_ffmpeg = (
@@ -86,11 +121,12 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
     cfg.chunk_ms,
     cfg.whisper_model.clone(),
     cfg.whisper_threads,
+    speaker_buf_handle,
     );
     
     // Mock producer
     let handle = tokio::spawn(async move {
-        let (tx, mut stop_rx, ffmpeg, format, device, sr, chunk_ms, whisper_model, whisper_threads) = cfg_ffmpeg;
+        let (tx, mut stop_rx, ffmpeg, format, device, sr, chunk_ms, whisper_model, whisper_threads, speaker_buf_handle) = cfg_ffmpeg;
 
         // ---- ffmpeg command: microphone -> mono s16le @ sr Hz -> stdout ----
         let dev = device_arg(&format, &device);
@@ -116,6 +152,9 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
 
         let bytes_per_sample = 2usize; // i16
         let samples_per_chunk = (sr as u64 * chunk_ms as u64 / 1000) as usize;
+        let speaker_window_sec: usize = 6; 
+        let sr_usize = sr as usize;
+        let speaker_buf_cap = sr_usize * speaker_window_sec;
         let bytes_per_chunk = samples_per_chunk * bytes_per_sample;
 
         // ---- whisper init (load once per /start) ----
@@ -144,6 +183,17 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
                 for i in (0..buf.len()).step_by(2) {
                     pcm.push(i16::from_le_bytes([buf[i], buf[i + 1]]));
                 }
+
+                {
+                // Append to shared ring buffer and truncate to cap
+                let mut sb = speaker_buf_handle.lock().await;
+                for &s in &pcm {
+                    sb.push_back(s);
+                }
+                while sb.len() > speaker_buf_cap {
+                    sb.pop_front();
+                }
+            }
 
                 // simple VAD + dBFS
                 let (is_voice, db) = vad_rms_db(&pcm);
@@ -225,6 +275,62 @@ async fn stop(app: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().body("stopped")
 }
 
+#[get("/speaker_snapshot")]
+async fn speaker_snapshot(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Responder {
+    use byteorder::{LittleEndian, WriteBytesExt};
+
+    let sr = cfg.sample_rate as u32;
+
+    // pull a copy of current buffer
+    let pcm_i16: Vec<i16> = {
+        let guard = app.speaker_buf.lock().await; 
+        guard.iter().copied().collect()
+    };
+
+    if pcm_i16.is_empty() {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "no_speaker_audio",
+            "message": "No speaker audio captured yet. Please start recording and speak first."
+        }));
+    }
+
+    // build a PCM16 mono WAV in-memory
+    let mut data_bytes = Vec::with_capacity(pcm_i16.len() * 2);
+    for s in pcm_i16 {
+        data_bytes.write_i16::<LittleEndian>(s).unwrap();
+    }
+
+    // WAV header (44 bytes)
+    let mut wav = Vec::with_capacity(44 + data_bytes.len());
+    let byte_rate = sr * 1 * 16 / 8; // sr * channels * bits/8
+    let block_align = 1 * 16 / 8;
+
+    // RIFF header
+    wav.extend_from_slice(b"RIFF");
+    wav.write_u32::<LittleEndian>((36 + data_bytes.len()) as u32).unwrap();
+    wav.extend_from_slice(b"WAVE");
+
+    // fmt chunk
+    wav.extend_from_slice(b"fmt ");
+    wav.write_u32::<LittleEndian>(16).unwrap();             // PCM fmt chunk size
+    wav.write_u16::<LittleEndian>(1).unwrap();              // PCM
+    wav.write_u16::<LittleEndian>(1).unwrap();              // mono
+    wav.write_u32::<LittleEndian>(sr).unwrap();             // sample rate
+    wav.write_u32::<LittleEndian>(byte_rate).unwrap();      // byte rate
+    wav.write_u16::<LittleEndian>(block_align).unwrap();    // block align
+    wav.write_u16::<LittleEndian>(16).unwrap();             // bits per sample
+
+    // data chunk
+    wav.extend_from_slice(b"data");
+    wav.write_u32::<LittleEndian>(data_bytes.len() as u32).unwrap();
+    wav.extend_from_slice(&data_bytes);
+
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, "audio/wav"))
+        .body(wav)
+}
+
+
 #[get("/stream/raw")]
 async fn stream_raw(app: web::Data<AppState>) -> impl Responder {
     let rx = app.tx.subscribe();
@@ -262,9 +368,11 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
 
     let http = Client::new();
     let base = cfg.translate_base.clone();
+    let coqui_voice = cfg.coqui_voice.clone();
+    let server_port = cfg.port;
 
     // Transform incoming JSON lines: translate "text" when present
-    let stream = futures_util::stream::unfold((rx, http, base, target), |(mut rx, http, base, target)| async move {
+    let stream = futures_util::stream::unfold((rx, http, base, target, coqui_voice, server_port), |(mut rx, http, base, target, coqui_voice, server_port)| async move {
         match rx.recv().await {
             Ok(line) => {
                 // parse JSON object; if it has "text", translate it
@@ -275,7 +383,20 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
                             if !text.trim().is_empty() {
                                 let tr = translate_text(&http, &base, text, &target).await;
                                 if let Some(obj) = node.as_object_mut() {
-                                    obj.insert("text".into(), Json::String(tr));
+
+                                        // generate audio_url for Coqui
+                                        let enc_text = urlencoding::encode(&tr);
+                                        obj.insert("text".into(), Json::String(tr.clone()));
+                                        // Build snapshot URL on this same server
+                                        let self_base = format!("http://127.0.0.1:{}", server_port);
+                                        let snapshot = format!("{}/speaker_snapshot", self_base);
+                                        let audio_url = format!(
+                                        "/tts_proxy?lang={}&speaker_wav={}&text={}",
+                                        target,
+                                        urlencoding::encode(&snapshot),
+                                        enc_text
+                                    );
+                                        obj.insert("audio_url".into(), Json::String(audio_url));
                                 }
                                 out_line = node.to_string();
                             }
@@ -286,7 +407,7 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
                     }
                 }
                 let frame = format!("data: {}\n\n", out_line);
-                Some((Ok::<Bytes, Infallible>(Bytes::from(frame)), (rx, http, base, target)))
+                Some((Ok::<Bytes, Infallible>(Bytes::from(frame)), (rx, http, base, target, coqui_voice, server_port)))
             }
             Err(_) => None,
         }
@@ -304,6 +425,245 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
         .insert_header((header::CONNECTION, "keep-alive"))
         .streaming(merged)
 }
+
+#[get("/tts_proxy")]
+async fn tts_proxy(req: HttpRequest, cfg: web::Data<Config>) -> impl Responder {
+    use actix_web::HttpResponse;
+    use reqwest::Client;
+
+    let params: std::collections::HashMap<_, _> =
+        url::form_urlencoded::parse(req.query_string().as_bytes()).into_owned().collect();
+
+    let text  = params.get("text").map(|s| s.as_str()).unwrap_or("");
+    let lang0 = params.get("lang").map(|s| s.as_str()).unwrap_or("en").to_string();
+
+    // voice is optional; treat empty/"default"/"none" as not provided
+    let raw_voice = params.get("voice").map(|s| s.as_str()).unwrap_or(&cfg.coqui_voice);
+    let voice_opt = match raw_voice.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "none" => None,
+        _ => Some(raw_voice.trim()),
+    };
+
+    // allow ?speaker_wav=... override, else use env-configured default
+    let speaker_wav_cfg = cfg.coqui_speaker_wav.clone();
+    let speaker_wav_qs  = params.get("speaker_wav").map(|s| s.as_str());
+    let speaker_wav_opt = {
+        let chosen = speaker_wav_qs.unwrap_or(speaker_wav_cfg.as_str());
+        let trimmed = chosen.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    };
+
+    // --- resolve speaker_wav URL -> local temp file, if needed ---
+    let http = Client::new();
+    let mut speaker_wav_local: Option<String> = speaker_wav_opt.map(|s| s.to_string());
+    let mut tmp_to_cleanup: Option<PathBuf> = None;
+
+    if let Some(ref s) = speaker_wav_local {
+        if s.starts_with("http://") || s.starts_with("https://") {
+            // fetch the snapshot bytes
+            let resp = match http.get(s).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    return HttpResponse::BadGateway()
+                        .body(format!("snapshot fetch error: {}", e));
+                }
+            };
+
+            // Check if the snapshot endpoint returned an error
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let error_text = resp.text().await.unwrap_or_default();
+
+                // If it's a 400 from our speaker_snapshot endpoint, try without speaker_wav
+                if status == 400 {
+                    log::warn!(
+                        "Speaker snapshot not ready, falling back to TTS without speaker_wav: {}",
+                        error_text
+                    );
+                    speaker_wav_local = None;
+                } else {
+                    return HttpResponse::BadGateway()
+                        .body(format!("snapshot fetch failed with status {}: {}", status, error_text));
+                }
+            } else {
+                let bytes = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return HttpResponse::BadGateway()
+                            .body(format!("snapshot read error: {}", e));
+                    }
+                };
+
+                // write to a temp .wav
+                let mut p = std::env::temp_dir();
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+                p.push(format!("coqui_ref_{}.wav", ts));
+                if let Err(e) = fs::write(&p, &bytes) {
+                    return HttpResponse::InternalServerError()
+                        .body(format!("temp write error: {}", e));
+                }
+                speaker_wav_local = Some(p.to_string_lossy().to_string());
+                tmp_to_cleanup = Some(p);
+            }
+        }
+    }
+
+    if text.trim().is_empty() {
+        return HttpResponse::BadRequest().body("missing text");
+    }
+
+    let base = cfg.coqui_base.trim_end_matches('/').to_string();
+    let url  = format!("{}/tts", base);
+
+    let chunks = normalize_and_chunk(text, 220);
+
+    // language candidates + autodetect fallback
+    let mut lang_candidates: Vec<String> = match lang0.to_lowercase().as_str() {
+        "ko" | "kr" | "ko-kr"            => vec!["ko".into(), "ko-KR".into(), "Korean".into()],
+        "ja" | "jp" | "ja-jp"            => vec!["ja".into(), "ja-JP".into(), "Japanese".into() ],
+        "zh" | "zh-cn" | "zh-hans"       => vec!["zh".into(), "zh-CN".into(), "cmn-Hans-CN".into(), "Chinese".into()],
+        "zh-tw" | "zh-hant"              => vec!["zh-TW".into(), "cmn-Hant-TW".into(), "Chinese".into()],
+        "fr" | "fr-fr"                   => vec!["fr".into(), "fr-FR".into(), "French".into()],
+        _                                => vec![lang0.clone()],
+    };
+    lang_candidates.push("__AUTO__".into());
+
+    async fn try_once(
+        http: &Client,
+        url: &str,
+        lang_opt: Option<&str>,
+        _voice_opt: Option<&str>,
+        speaker_wav_opt: Option<&str>,
+        chunks: &[String],
+    ) -> Result<Vec<u8>, (u16, String)> {
+        let mut wav_concat: Vec<u8> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut body = serde_json::json!({
+                "text": chunk,
+                "audio_format": "wav"
+            });
+            if let Some(l) = lang_opt {
+                body["language"] = serde_json::Value::String(l.to_string());
+            }
+            if let Some(wav) = speaker_wav_opt {
+                body["speaker_wav"] = serde_json::Value::String(wav.to_string());
+            }
+
+            let resp = http.post(url).json(&body).send().await
+                .map_err(|e| (502u16, format!("connect error: {}", e)))?;
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let msg = resp.text().await.unwrap_or_default();
+                return Err((status, msg));
+            }
+            let mut bytes = resp.bytes().await
+                .map_err(|e| (502u16, format!("bytes error: {}", e)))?
+                .to_vec();
+
+            if i == 0 {
+                wav_concat.append(&mut bytes);
+            } else {
+                // naive WAV concat: strip 44-byte header from subsequent chunks
+                if bytes.len() > 44 { wav_concat.extend_from_slice(&bytes[44..]); }
+                else { wav_concat.extend_from_slice(&bytes); }
+            }
+        }
+        Ok(wav_concat)
+    }
+
+    let mut last_err: Option<(u16, String)> = None;
+    for cand_lang in &lang_candidates {
+        let lang_opt = if cand_lang == "__AUTO__" { None } else { Some(cand_lang.as_str()) };
+
+        // try with voice (if provided), then without voice
+        for v in [voice_opt, None] {
+            match try_once(&http, &url, lang_opt, v, speaker_wav_local.as_deref(), &chunks).await {
+                Ok(wav) => {
+                    if let Some(p) = tmp_to_cleanup.take() { let _ = fs::remove_file(p); }
+                    return HttpResponse::Ok()
+                        .insert_header((header::CONTENT_TYPE, "audio/wav"))
+                        .body(wav);
+                }
+                Err(e) => { last_err = Some(e); }
+            }
+        }
+        if let Some(p) = tmp_to_cleanup.take() { let _ = fs::remove_file(p); }
+    }
+
+    let (code, msg) = last_err.unwrap_or((502u16, "unknown coqui error".into()));
+    HttpResponse::BadGateway().body(format!("coqui error {}: {}", code, msg))
+}
+
+
+#[get("/demo")]
+async fn demo_page() -> impl Responder {
+    let html = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Live Translator + Coqui</title>
+<style>
+body { font-family: system-ui, Arial; margin: 2rem; }
+.log { max-height: 40vh; overflow:auto; border:1px solid #ccc; padding:0.5rem; }
+.entry { margin:.25rem 0; }
+</style>
+</head>
+<body>
+<h1>Live Translator + Coqui</h1>
+<p>
+  <button id="start">start</button>
+  <button id="stop">stop</button>
+  <label>Translate to: <input id="lang" value="en" size="4"></label>
+</p>
+<div class="log" id="log"></div>
+<script>
+const log = (m) => {
+  const d = document.createElement('div');
+  d.className = 'entry';
+  d.textContent = m;
+  document.getElementById('log').appendChild(d);
+  document.getElementById('log').scrollTop = 1e9;
+};
+
+async function call(path) {
+  const r = await fetch(path, {method:'POST'});
+  log(path + ' -> ' + (await r.text()));
+}
+
+document.getElementById('start').onclick = ()=>call('/start');
+document.getElementById('stop').onclick  = ()=>call('/stop');
+
+let es;
+function connect() {
+  const to = document.getElementById('lang').value || 'en';
+  if (es) es.close();
+  es = new EventSource('/stream/translated?to=' + encodeURIComponent(to));
+  es.onmessage = (ev) => {
+    try {
+      const o = JSON.parse(ev.data);
+      if (o.text) {
+        log(`[${(o.t0??0).toFixed?.(2)}] ${o.text}`);
+        if (o.audio_url) {
+          const a = new Audio(o.audio_url);
+          a.play().catch(()=>{});
+        }
+      }
+    } catch(e) {
+      log('bad JSON: ' + ev.data);
+    }
+  };
+  es.onerror = () => log('SSE error (will keep trying)');
+}
+connect();
+document.getElementById('lang').addEventListener('change', connect);
+</script>
+</body>
+</html>"#;
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"))
+        .body(html)
+}
+
 
 #[get("/debug/sse")]
 async fn debug_sse() -> impl Responder {
@@ -347,6 +707,9 @@ async fn main() -> std::io::Result<()> {
             .service(stream_raw)
             .service(debug_sse)
             .service(stream_translated)
+            .service(tts_proxy)
+            .service(speaker_snapshot)
+            .service(demo_page)
     })
     .bind(("127.0.0.1", cfg.port))?
     .run()

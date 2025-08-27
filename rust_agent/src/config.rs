@@ -12,6 +12,9 @@ pub struct Config {
     pub whisper_model: String,
     pub whisper_threads: usize,
     pub translate_base: String,
+    pub coqui_base: String,
+    pub coqui_voice: String,
+    pub coqui_speaker_wav: String,
 
 }
 
@@ -44,6 +47,11 @@ impl Config {
         let translate_base = env::var("TRANSLATE_BASE")
             .unwrap_or_else(|_| "http://127.0.0.1:5000".to_string());
 
+        // Coqui TTS for voice
+        let coqui_base  = env::var("COQUI_BASE").unwrap_or_else(|_| "http://127.0.0.1:8020".to_string());
+        let coqui_voice = env::var("COQUI_VOICE").unwrap_or_else(|_| "English".to_string());
+        let coqui_speaker_wav = env::var("COQUI_SPEAKER_WAV").unwrap_or_default();
+
         Self { 
             port,
             ffmpeg,
@@ -54,6 +62,9 @@ impl Config {
             whisper_model, 
             whisper_threads,
             translate_base,
+            coqui_base,
+            coqui_voice,
+            coqui_speaker_wav,
         }
     }
 }
