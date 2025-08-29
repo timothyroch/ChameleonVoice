@@ -13,10 +13,13 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use reqwest::Client;
 use serde_json::{Value as Json, json};
 use actix_web::HttpRequest;
-use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}, sync::Arc};
+use std::collections::HashMap;
+
 
 mod config;
 mod state;
+mod multi_threads;
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -101,7 +104,11 @@ fn normalize_and_chunk(text: &str, max_len: usize) -> Vec<String> {
 
 
 #[post("/start")]
-async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Responder {
+async fn start(
+    app: web::Data<AppState>,
+     cfg: web::Data<Config>,
+     q: web::Query<HashMap<String, String>>,
+    ) -> impl Responder {
     let mut worker = app.worker.lock().await;
     if worker.is_some() { return HttpResponse::Ok().body("already running"); }
 
@@ -109,6 +116,17 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
     let _ = app.stop_tx.send(false);
     let tx = app.tx.clone();
     let speaker_buf_handle = app.speaker_buf.clone();
+
+    // decide mode
+    let mode = q.get("mode").map(|s| s.as_str()).unwrap_or("");
+    let enable_multi= match mode {
+        "multi" => true,
+        "single" => false,
+        _ => std::env::var("ENABLE_MULTI").ok().as_deref()== Some("1"), // fallback to env
+    };
+    let lang_force: Option<String> = q.get("lang")
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty() && s.to_ascii_lowercase() != "auto");
 
     // capture the config values we need into the task
     let cfg_ffmpeg = (
@@ -122,11 +140,13 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
     cfg.whisper_model.clone(),
     cfg.whisper_threads,
     speaker_buf_handle,
+    enable_multi,
+    lang_force.clone(),
     );
     
     // Mock producer
     let handle = tokio::spawn(async move {
-        let (tx, mut stop_rx, ffmpeg, format, device, sr, chunk_ms, whisper_model, whisper_threads, speaker_buf_handle) = cfg_ffmpeg;
+        let (tx, mut stop_rx, ffmpeg, format, device, sr, chunk_ms, whisper_model, whisper_threads, speaker_buf_handle, enable_multi, lang_force) = cfg_ffmpeg;
 
         // ---- ffmpeg command: microphone -> mono s16le @ sr Hz -> stdout ----
         let dev = device_arg(&format, &device);
@@ -158,19 +178,37 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
         let bytes_per_chunk = samples_per_chunk * bytes_per_sample;
 
         // ---- whisper init (load once per /start) ----
-        let wctx = match WhisperContext::new_with_params(
+        let ctx = match WhisperContext::new_with_params(
         &whisper_model,
         WhisperContextParameters::default()
          ) {
-            Ok(c) => c,
+            Ok(c) => Arc::new(c),
             Err(e) => { let _ = tx.send(format!(r#"{{"error":"load whisper","msg":"{}"}}"#, e)); return; }
         };
-        let mut wstate = match wctx.create_state() {
-            Ok(s) => s,
-            Err(e) => { let _ = tx.send(format!(r#"{{"error":"whisper state","msg":"{}"}}"#, e)); return; }
-        };
+
+         #[allow(unused_mut)]
+        let mut maybe_job_tx: Option<tokio::sync::mpsc::Sender<multi_threads::AsrJob>> = None;
+        #[allow(unused_mut)]
+        let mut wstate_single = None;
+
+        if enable_multi {
+            // choose worker layout
+            let total = num_cpus::get_physical().max(1);
+            let workers = (total / 2).max(2);
+            let threads_per_state = (total / workers).max(1) as i32;
+            let jt = multi_threads::spawn_parallel_asr(ctx.clone(), threads_per_state, workers, tx.clone(), lang_force.clone(),);
+            maybe_job_tx = Some(jt);
+            let _ = tx.send(format!(r#"{{"info":"mode","value":"multi","workers":{},"threads_per_state":{}}}"#, workers, threads_per_state));
+        } else {
+            // original single-state decoder
+            match ctx.create_state() {
+                Ok(s) => { wstate_single = Some(s); let _ = tx.send(r#"{"info":"mode","value":"single"}"#.to_string()); }
+                Err(e) => { let _ = tx.send(format!(r#"{{"error":"whisper state","msg":"{}"}}"#, e)); return; }
+            }
+        }
 
         let mut buf = vec![0u8; bytes_per_chunk];
+        let mut seq_counter: u64 = 0;
         let mut t: f32 = 0.0;
         loop {
             if *stop_rx.borrow() { break; }
@@ -199,13 +237,23 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
                 let (is_voice, db) = vad_rms_db(&pcm);
 
                 // --- run whisper on this chunk if voice is active ---
-                let mut text_out = String::new();
                 if is_voice {
+                    let t1 = t + (samples_per_chunk as f32 / sr as f32);
                     let pcm_f32 = s16le_to_f32(&pcm);
+
+                    if let Some(job_tx) = &maybe_job_tx {
+                        use multi_threads::AsrJob;
+                        if job_tx.try_send(AsrJob { seq: seq_counter, t0: t, t1, pcm_f32 }).is_err() {
+                            let _ = tx.send(r#"{"warn":"asr_queue_full"}"#.to_string());
+
+                        }
+                        seq_counter = seq_counter.wrapping_add(1);
+                    } else if let Some(wstate) = wstate_single.as_mut() {
+                         
                     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
                     params.set_n_threads(whisper_threads as i32);
                     params.set_translate(false);
-                    params.set_language(Some("auto"));
+                    params.set_language(Some("en"));
                     params.set_no_timestamps(true);
                     params.set_print_special(false);
                     params.set_print_progress(false);
@@ -213,29 +261,29 @@ async fn start(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Respond
                     params.set_no_context(true);
                     params.set_single_segment(true);
                     params.set_temperature(0.0);
-                    params.set_max_len(64);
+                    params.set_max_len(120);
 
                     if let Err(e) = wstate.full(params, &pcm_f32) {
                         let _ = tx.send(format!(r#"{{"error":"whisper full","msg":"{}"}}"#, e));
                     } else {
+                        let mut text_out = String::new();
                         let n = wstate.full_n_segments().unwrap_or(0);
                         for i in 0..n {
                             if let Ok(seg) = wstate.full_get_segment_text(i) {
                                 text_out.push_str(&seg);
                             }
                         }
-                        text_out = text_out.trim().to_string();
+                        let text_out = text_out.trim().to_string();
+                        if !text_out.is_empty() {
+                            let _ = tx.send(format!(
+                                r#"{{"t0":{:.2},"t1":{:.2},"text":"{}","lang":"und"}}"#,
+                                t, t1, text_out.replace('"', "\\\"")
+                            ));
+                        }
                     }
+                  }
                 }
 
-                if !text_out.is_empty() {
-                    let t1 = t + (samples_per_chunk as f32 / sr as f32);
-                    let lang = "und"; // TODO: wire up language detection later
-                    let _ = tx.send(format!(
-                        r#"{{"t0":{:.2},"t1":{:.2},"text":"{}","lang":"{}"}}"#,
-                        t, t1, text_out.replace('"', "\\\""), lang
-                    ));
-                }
 
             // emit one frame
             let _ = tx.send(format!(
@@ -613,7 +661,21 @@ body { font-family: system-ui, Arial; margin: 2rem; }
 <p>
   <button id="start">start</button>
   <button id="stop">stop</button>
+  <div id="beat" style="
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: red;
+  margin: 1rem 0;
+  opacity: 0.3;
+  transition: opacity 0.1s, transform 0.1s;
+"></div>
   <label>Translate to: <input id="lang" value="en" size="4"></label>
+    <label style="margin-left:1rem;">ASR mode:
+    <select id="mode">
+      <option value="single">single (inline)</option>
+      <option value="multi" selected>multi (thread pool)</option>
+    </select>
+  </label>
 </p>
 <div class="log" id="log"></div>
 <script>
@@ -625,13 +687,25 @@ const log = (m) => {
   document.getElementById('log').scrollTop = 1e9;
 };
 
-async function call(path) {
-  const r = await fetch(path, {method:'POST'});
-  log(path + ' -> ' + (await r.text()));
+async function callStart() {
+    const mode = document.getElementById('mode').value || 'single';
+    const r = await fetch('/start?mode=' + encodeURIComponent(mode), {method:'POST'});
+    log('/start -> ' + (await r.text()));
 }
 
-document.getElementById('start').onclick = ()=>call('/start');
-document.getElementById('stop').onclick  = ()=>call('/stop');
+async function callStop() {
+    const r = await fetch('/stop', {method:'POST'});
+    log('/stop -> ' + (await r.text()));
+}
+
+document.getElementById('start').onclick = async () => {
+    await callStart();
+    startBeat();
+};
+document.getElementById('stop').onclick = async () => { 
+    await callStop();
+    stopBeat();
+};
 
 let es;
 function connect() {
@@ -656,6 +730,37 @@ function connect() {
 }
 connect();
 document.getElementById('lang').addEventListener('change', connect);
+let beatTimer = null;
+const CADENCE_MS = 1200;
+
+function pulseBeat() {
+  const b = document.getElementById('beat');
+  if (!b) return;
+  b.style.opacity = '1';
+  b.style.transform = 'scale(1.5)';
+  setTimeout(() => {
+    b.style.opacity = '.3';
+    b.style.transform = 'scale(1)';
+  }, 150);
+}
+
+function startBeat() {
+  stopBeat();          // ensure only one timer
+  pulseBeat();         // immediate visual on click
+  beatTimer = setInterval(pulseBeat, CADENCE_MS);
+}
+
+function stopBeat() {
+  if (beatTimer) {
+    clearInterval(beatTimer);
+    beatTimer = null;
+  }
+  const b = document.getElementById('beat');
+  if (b) {
+    b.style.opacity = '.3';
+    b.style.transform = 'scale(1)';
+  }
+}
 </script>
 </body>
 </html>"#;
