@@ -22,6 +22,7 @@ use whisper_rs_sys as sys;
 mod config;
 mod state;
 mod multi_threads;
+mod popup;
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -850,6 +851,13 @@ function stopBeat() {
         .body(html)
 }
 
+#[get("/dashboard")]
+async fn dashboard_page() -> impl Responder {
+    let html = include_str!("../assets/index.html");
+    HttpResponse::Ok()
+    .insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"))
+    .body(html)
+}
 
 #[get("/debug/sse")]
 async fn debug_sse() -> impl Responder {
@@ -884,7 +892,7 @@ async fn main() -> std::io::Result<()> {
 
     let cfg_data = web::Data::new(cfg.clone());
 
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(cfg_data.clone()) // share Config with handlers
             .app_data(shared.clone()) // provide AppState to handlers
@@ -898,8 +906,16 @@ async fn main() -> std::io::Result<()> {
             .service(tts_proxy)
             .service(speaker_snapshot)
             .service(demo_page)
+            .service(dashboard_page)
     })
     .bind(("127.0.0.1", cfg.port))?
-    .run()
-    .await
+    .run();
+    
+    // spawn popup
+    let popup_url_port = cfg.port;
+    std::thread::spawn(move || {
+        crate::popup::run_popup(popup_url_port);
+    });
+    // keep actix running
+    server.await
 }
