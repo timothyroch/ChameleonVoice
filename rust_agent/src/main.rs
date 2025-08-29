@@ -440,12 +440,12 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
                                         let enc_text = urlencoding::encode(&tr);
                                         obj.insert("text".into(), Json::String(tr.clone()));
                                         // Build snapshot URL on this same server
-                                        let self_base = format!("http://127.0.0.1:{}", server_port);
-                                        let snapshot = format!("{}/speaker_snapshot", self_base);
+                                        //let self_base = format!("http://127.0.0.1:{}", server_port);
+                                        //let snapshot = format!("{}/speaker_snapshot", self_base);
                                         let audio_url = format!(
-                                        "/tts_proxy?lang={}&speaker_wav={}&text={}",
+                                        "/tts_proxy?lang={}&text={}",
                                         target,
-                                        urlencoding::encode(&snapshot),
+                                        //urlencoding::encode(&snapshot),
                                         enc_text
                                     );
                                         obj.insert("audio_url".into(), Json::String(audio_url));
@@ -497,17 +497,26 @@ async fn tts_proxy(req: HttpRequest, cfg: web::Data<Config>) -> impl Responder {
     };
 
     // allow ?speaker_wav=... override, else use env-configured default
-    let speaker_wav_cfg = cfg.coqui_speaker_wav.clone();
-    let speaker_wav_qs  = params.get("speaker_wav").map(|s| s.as_str());
+    //let speaker_wav_cfg = cfg.coqui_speaker_wav.clone();
+    //let speaker_wav_qs  = params.get("speaker_wav").map(|s| s.as_str());
     let speaker_wav_opt = {
-        let chosen = speaker_wav_qs.unwrap_or(speaker_wav_cfg.as_str());
-        let trimmed = chosen.trim();
+        //let chosen = speaker_wav_qs.unwrap_or(speaker_wav_cfg.as_str());
+        let trimmed = cfg.coqui_speaker_wav.trim();
         if trimmed.is_empty() { None } else { Some(trimmed) }
     };
 
     // --- resolve speaker_wav URL -> local temp file, if needed ---
     let http = Client::new();
     let mut speaker_wav_local: Option<String> = speaker_wav_opt.map(|s| s.to_string());
+    match speaker_wav_local.as_deref() {
+    Some(p) if !p.trim().is_empty() => {
+        log::info!("XTTS: using speaker_wav = {}", p);
+    }
+    _ => {
+        log::error!("XTTS: NO speaker_wav resolved. Set COQUI_SPEAKER_WAV in .env or pass ?speaker_wav.");
+        return HttpResponse::BadRequest().body("missing speaker_wav: set COQUI_SPEAKER_WAV or pass ?speaker_wav=...");
+    }
+    }
     let mut tmp_to_cleanup: Option<PathBuf> = None;
 
     if let Some(ref s) = speaker_wav_local {
@@ -810,10 +819,12 @@ async fn debug_sse() -> impl Responder {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Init logger
+    let _ = dotenvy::dotenv();
     env_logger::init();
     info!("Starting Live Translator...");
 
     let cfg = Config::from_env();
+    info!("Loaded COQUI_SPEAKER_WAV = {:?}", cfg.coqui_speaker_wav);
 
     info!("HTTP server listening on 127.0.0.1:{}", cfg.port);
 
