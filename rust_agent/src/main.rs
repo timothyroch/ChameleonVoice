@@ -15,6 +15,8 @@ use serde_json::{Value as Json, json};
 use actix_web::HttpRequest;
 use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}, sync::Arc};
 use std::collections::HashMap;
+use std::ffi::{c_void, CStr};
+use whisper_rs_sys as sys; 
 
 
 mod config;
@@ -258,17 +260,65 @@ async fn start(
                     } else {
                         params.set_language(Some("auto"));
                     }
-                    params.set_no_timestamps(true);
+                    params.set_no_timestamps(false);
                     params.set_print_special(false);
                     params.set_print_progress(false);
                     params.set_print_realtime(false);
                     params.set_no_context(true);
-                    params.set_single_segment(true);
+                    params.set_single_segment(false);
                     params.set_temperature(0.0);
-                    params.set_max_len(120);
+                    params.set_max_len(60);
 
-                    if let Err(e) = wstate.full(params, &pcm_f32) {
-                        let _ = tx.send(format!(r#"{{"error":"whisper full","msg":"{}"}}"#, e));
+                    // streaming via C callback
+                    #[repr(C)]
+                    struct CbData { tx: tokio::sync::broadcast::Sender<String> }
+
+                    unsafe extern "C" fn on_new_segment(
+                        _ctx: *mut sys::whisper_context,
+                        state: *mut sys::whisper_state,
+                        _new_segment: i32,
+                        user_data: *mut c_void,
+                    ) {
+                        if user_data.is_null() || state.is_null() { return; }
+                        let data = &*(user_data as *const CbData);
+
+                        let n = sys::whisper_full_n_segments_from_state(state);
+                        if n <= 0 { return; }
+                        let i = n - 1;
+
+                        let c_text = sys::whisper_full_get_segment_text_from_state(state, i);
+                        if c_text.is_null() { return; }
+                        let txt = CStr::from_ptr(c_text).to_string_lossy().into_owned();
+
+                        let t0 = sys::whisper_full_get_segment_t0_from_state(state, i);
+                        let t1 = sys::whisper_full_get_segment_t1_from_state(state, i);
+
+                        let _ = data.tx.send(format!(
+                            r#"{{"partial":true,"t0":{:.2},"t1":{:.2},"text"
+                            :"{}","lang":"und"}}"#,
+                            (t0 as f32) * 0.01, (t1 as f32) * 0.01, txt.replace('"', "\\\"")
+                        ));
+                    }
+
+                        // allocate user_data that lives through the call
+                        let cb_data = Box::new(CbData { tx: tx.clone() });
+                        let ud_ptr = Box::into_raw(cb_data) as *mut c_void;
+
+                        // register callback (unsafe FFI)
+                        unsafe {
+                            params.set_new_segment_callback(Some(on_new_segment));
+                            params.set_new_segment_callback_user_data(ud_ptr);
+                        }
+
+                        // run inference once for this chunk
+                        let full_res = wstate.full(params, &pcm_f32);
+
+                        // reclaim user data
+                        unsafe { let _ = Box::from_raw(ud_ptr as *mut CbData); }
+
+                        // final emission for completeness
+                        if let Err(e) = full_res {
+                            let _ = tx.send(format!(r#"{{"error":"whisper full","msg":"{}"}}"#, e));
                     } else {
                         let mut text_out = String::new();
                         let n = wstate.full_n_segments().unwrap_or(0);
@@ -744,9 +794,11 @@ function connect() {
   es.onmessage = (ev) => {
     try {
       const o = JSON.parse(ev.data);
-      if (o.text) {
+      if (o.partial) {
         log(`[${(o.t0??0).toFixed?.(2)}] ${o.text}`);
-        if (o.audio_url) {
+        } else if (o.text) {
+           log(`[${(o.t0??0).toFixed?.(2)}] ${o.text}`);
+          if (o.audio_url) {
           const a = new Audio(o.audio_url);
           a.play().catch(()=>{});
         }
