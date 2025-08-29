@@ -253,7 +253,11 @@ async fn start(
                     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
                     params.set_n_threads(whisper_threads as i32);
                     params.set_translate(false);
-                    params.set_language(Some("en"));
+                    if let Some(ref l) = lang_force {
+                        params.set_language(Some(l));
+                    } else {
+                        params.set_language(Some("auto"));
+                    }
                     params.set_no_timestamps(true);
                     params.set_print_special(false);
                     params.set_print_progress(false);
@@ -676,6 +680,19 @@ body { font-family: system-ui, Arial; margin: 2rem; }
       <option value="multi" selected>multi (thread pool)</option>
     </select>
   </label>
+  <label style="margin-left:1rem;">ASR language:
+  <select id="asr_lang">
+    <option value="auto">auto</option>
+    <option value="en" selected>English (en)</option>
+    <option value="ja">Japanese (ja)</option>
+    <option value="fr">French (fr)</option>
+    <option value="es">Spanish (es)</option>
+    <option value="de">German (de)</option>
+    <option value="ko">Korean (ko)</option>
+    <option value="zh">Chinese (zh)</option>
+  </select>
+</label>
+
 </p>
 <div class="log" id="log"></div>
 <script>
@@ -689,7 +706,10 @@ const log = (m) => {
 
 async function callStart() {
     const mode = document.getElementById('mode').value || 'single';
-    const r = await fetch('/start?mode=' + encodeURIComponent(mode), {method:'POST'});
+    const asrLang = (document.getElementById('asr_lang')?.value || 'auto');
+    const qs = '/start?mode=' + encodeURIComponent(mode) +
+             '&lang=' + encodeURIComponent(asrLang);
+    const r = await fetch(qs, {method:'POST'});
     log('/start -> ' + (await r.text()));
 }
 

@@ -62,7 +62,11 @@ pub fn spawn_parallel_asr(
                 let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
                 params.set_n_threads(threads_per_state);
                 params.set_translate(false);
-                params.set_language(Some("en"));       
+                if let Some(ref l) = lang_force2 {
+                    params.set_language(Some(l));
+                } else {
+                    params.set_language(Some("auto"));
+                }     
                 params.set_no_timestamps(true);
                 params.set_print_special(false);
                 params.set_print_progress(false);
