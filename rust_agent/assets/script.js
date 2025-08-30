@@ -68,12 +68,21 @@ function connectSSE(){
 
       // partial
       if(o.partial){
-        origTranscript.textContent = (o.orig ?? o.text) || '';
+        if (o.text && (o.text.includes("[") || o.text.includes("("))) {
+            origTranscript.textContent = "";    
+        } else {
+            origTranscript.textContent = (o.orig ?? o.text) || '';
+        }
         return;
       }
 
       // final
       if(o.text){
+        if (o.text.includes("[") || o.text.includes("(")) {
+            origTranscript.textContent = "";
+            trTranscript.textContent = "";
+            return;    
+        }
         // original language
         origTranscript.textContent = (o.orig ?? "no text received") || '';
         // translated language
