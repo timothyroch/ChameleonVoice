@@ -23,8 +23,8 @@ pub fn run_popup(port: u16) {
     let mut builder = WindowBuilder::new()
         .with_title("Dashboard")
         .with_inner_size(LogicalSize::new(width, height))
-        .with_resizable(false)
-        .with_decorations(false) // frameless
+        .with_resizable(true)
+        .with_decorations(true) // frameless
         .with_transparent(true)
         .with_always_on_top(true);
 
