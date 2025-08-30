@@ -17,6 +17,7 @@ use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}, sync::Arc};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use whisper_rs_sys as sys; 
+use actix_files::Files;
 
 
 mod config;
@@ -907,6 +908,7 @@ async fn main() -> std::io::Result<()> {
             .service(speaker_snapshot)
             .service(demo_page)
             .service(dashboard_page)
+            .service(Files::new("/assets", "./assets").prefer_utf8(true))
     })
     .bind(("127.0.0.1", cfg.port))?
     .run();
