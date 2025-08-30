@@ -68,14 +68,16 @@ function connectSSE(){
 
       // partial
       if(o.partial){
-        origTranscript.textContent = o.text || '';
+        origTranscript.textContent = (o.orig ?? o.text) || '';
         return;
       }
 
       // final
       if(o.text){
-        origTranscript.textContent = o.text;
-        trTranscript.textContent = o.text;
+        // original language
+        origTranscript.textContent = (o.orig ?? "no text received") || '';
+        // translated language
+        trTranscript.textContent = o.text  || '';
         if(o.audio_url){
           const a = new Audio(o.audio_url);
           a.play().catch(()=>{});

@@ -489,7 +489,8 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
                                 let skip_tts = trimmed.contains("[") || trimmed.contains("(");
                                 let tr = translate_text(&http, &base, trimmed, &target).await;
                                 if let Some(obj) = node.as_object_mut() {
-
+                                        // keep original for UI
+                                        obj.insert("orig".into(), Json::String(trimmed.to_string()));
                                         // generate audio_url for Coqui
                                         let enc_text = urlencoding::encode(&tr);
                                         obj.insert("text".into(), Json::String(tr.clone()));
