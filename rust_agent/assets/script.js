@@ -100,10 +100,25 @@ function connectSSE(){
   es.onerror = ()=>{};
 }
 
+let paused = false;
+
+async function togglePause(){
+  paused = !paused;
+  try {
+    await fetch('/pause?on=' + (paused ? '1' : '0'), { method:'POST' });
+  } catch(_) {}
+
+  // UI states
+  pauseBtn.classList.toggle('paused', paused);
+  pauseBtn.setAttribute('aria-pressed', paused ? 'true' : 'false');
+  pauseBtn.querySelector('span').textContent = paused ? 'Resume' : 'Pause';
+}
+
 async function startEngine(){
   running = true;
   pauseBtn.classList.remove('paused');
   pauseBtn.setAttribute('aria-pressed','false');
+  paused = false;
 
   const asrLang = asrLangSel.value || 'auto';
   asrLangLabel.textContent = nameFor(asrLang);
@@ -119,7 +134,7 @@ async function stopEngine(){
   try{ await fetch('/stop', {method:'POST'}); }catch(_){}
 }
 
-pauseBtn.addEventListener('click', ()=>{ running ? stopEngine() : startEngine(); });
+pauseBtn.addEventListener('click', ()=>{ running ? togglePause() : startEngine(); });
 
 // React to language changes
 asrLangSel.addEventListener('change', async ()=>{
