@@ -34,7 +34,7 @@ pub fn spawn_parallel_asr(
     tx_sse: tokio::sync::broadcast::Sender<String>,
     lang_force: Option<String>,
 ) -> mpsc::Sender<AsrJob>{
-    let (job_tx, mut job_rx) = mpsc::channel::<AsrJob>(256);
+    let (job_tx, job_rx) = mpsc::channel::<AsrJob>(256);
     let rx_shared = Arc::new(Mutex::new(job_rx));
     let (res_tx, mut res_rx) = mpsc::channel::<AsrRes>(256);
 

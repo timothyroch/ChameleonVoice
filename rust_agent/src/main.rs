@@ -136,6 +136,7 @@ async fn start(
     let cfg_ffmpeg = (
     tx.clone(),
     app.stop_tx.subscribe(),
+    app.pause_tx.subscribe(),
     cfg.ffmpeg.clone(),
     cfg.ffmpeg_format.clone(),
     cfg.ffmpeg_device.clone(),
@@ -150,7 +151,8 @@ async fn start(
     
     // Mock producer
     let handle = tokio::spawn(async move {
-        let (tx, mut stop_rx, ffmpeg, format, device, sr, chunk_ms, whisper_model, whisper_threads, speaker_buf_handle, enable_multi, lang_force) = cfg_ffmpeg;
+        let (tx, mut stop_rx, mut pause_rx, ffmpeg, format, device, sr, chunk_ms,
+             whisper_model, whisper_threads, speaker_buf_handle, enable_multi, lang_force) = cfg_ffmpeg;
 
         // ---- ffmpeg command: microphone -> mono s16le @ sr Hz -> stdout ----
         let dev = device_arg(&format, &device);
@@ -225,6 +227,20 @@ async fn start(
                 for i in (0..buf.len()).step_by(2) {
                     pcm.push(i16::from_le_bytes([buf[i], buf[i + 1]]));
                 }
+
+                if *pause_rx.borrow() {
+                    let _ = tx.send(format!(
+                        r#"{{"t0":{:.2},"db":-90.0,"voice":false,"sr":{},"chunk_ms":{}}}"#,
+                        t, sr, chunk_ms
+                    ));
+                    t += (samples_per_chunk as f32) / (sr as f32);
+                     tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(0)) => {},
+                        _ = pause_rx.changed() => {},
+                        _ = stop_rx.changed() => { if *stop_rx.borrow() { break; } }
+                }
+                continue;
+            }
 
                 {
                 // Append to shared ring buffer and truncate to cap
@@ -379,6 +395,21 @@ async fn stop(app: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().body("stopped")
 }
 
+#[post("/pause")]
+async fn pause(
+    app: web::Data<AppState>,
+    q: web::Query<std::collections::HashMap<String, String>>,
+) -> impl Responder {
+    // ?on=1 / ?on=true pauses; anything else unpauses
+    let on = q
+        .get("on")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let _ = app.pause_tx.send(on);
+    let body = if on { "paused" } else { "resumed" };
+    HttpResponse::Ok().body(body)
+}
+
 #[get("/speaker_snapshot")]
 async fn speaker_snapshot(app: web::Data<AppState>, cfg: web::Data<Config>) -> impl Responder {
     use byteorder::{LittleEndian, WriteBytesExt};
@@ -489,7 +520,8 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
                                 let skip_tts = trimmed.contains("[") || trimmed.contains("(");
                                 let tr = translate_text(&http, &base, trimmed, &target).await;
                                 if let Some(obj) = node.as_object_mut() {
-
+                                        // keep original for UI
+                                        obj.insert("orig".into(), Json::String(trimmed.to_string()));
                                         // generate audio_url for Coqui
                                         let enc_text = urlencoding::encode(&tr);
                                         obj.insert("text".into(), Json::String(tr.clone()));
@@ -915,6 +947,7 @@ async fn main() -> std::io::Result<()> {
             .service(demo_page)
             .service(dashboard_page)
             .service(Files::new("/assets", "./assets").prefer_utf8(true))
+            .service(pause)
     })
     .bind(("127.0.0.1", cfg.port))?
     .run();
