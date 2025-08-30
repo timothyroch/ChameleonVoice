@@ -1,0 +1,101 @@
+:root{
+  --bg:#0c0f12;           /* page */
+  --panel:#11161b;        /* cards */
+  --panel-2:#0f1318;      /* headers */
+  --text:#dbe4ee;         /* primary text */
+  --muted:#8a96a8;        /* secondary text */
+  --accent:#1fe0b0;       
+  --accent-2:#17b791;     
+  --danger:#ff5d5d;
+  --border:#1e2430;
+  --card-radius:16px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+  background: radial-gradient(1200px 800px at 80% -10%, #15212b 0%, transparent 60%), var(--bg);
+  color: var(--text);
+  padding:24px;
+  overflow-x:hidden;
+}
+
+.wrap{max-width:1100px;margin:0 auto;overflow-x:hidden}
+.header{
+  display:flex; align-items:center; gap:10px; margin-bottom:16px; flex-wrap:wrap;
+}
+.header .spark{width:22px;height:22px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),#68ffd9);border-radius:8px;box-shadow:0 0 24px #19e6b5aa}
+.header h2{margin:0;font-weight:700;letter-spacing:.2px}
+.beta{margin-left:8px; font-size:12px; color:#84f4db; background:#0d1b16; border:1px solid #145d47; padding:2px 8px; border-radius:999px}
+
+.controls{
+  display:flex; gap:12px; flex-wrap:wrap; margin:8px 0 18px 0;
+}
+.control{
+  display:flex; align-items:center; gap:8px;
+  background:var(--panel); border:1px solid var(--border); padding:8px 10px; border-radius:12px;
+  color:#b7c3d6;
+}
+select{
+  background:#0d1520; color:#cfe0f5; border:1px solid #1e2a3a; border-radius:8px; padding:6px 8px; outline:none;
+}
+
+.grid{
+  display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:18px;
+}
+
+.panel{
+  background: linear-gradient(180deg, var(--panel), var(--panel-2));
+  border:1px solid var(--border);
+  border-radius: var(--card-radius);
+  box-shadow: 0 8px 28px #00000055 inset, 0 1px 0 #ffffff08;
+  min-width:0; /* prevent overflow in grid columns */
+}
+.slot{
+  min-height:92px; display:flex; align-items:center; padding:18px 16px; color:var(--muted); font-size:14px;
+}
+.slot .mic, .slot .spk{margin-right:10px; opacity:.9; flex:0 0 auto}
+.slot .transcript{color:var(--text); opacity:.95; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%}
+
+.wave-card{padding:12px 12px 16px}
+.wave-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; gap:8px}
+.lang{
+  display:flex; align-items:center; gap:8px; font-weight:600; min-width:0;
+}
+.lang .pill{font-size:12px; color:#9fb0c3; background:#0d1520; border:1px solid #1e2a3a; padding:2px 8px; border-radius:999px}
+.lang span{white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+
+.badge{font-size:12px; background:#0f231d; color:#a5f2dd; border:1px solid #174d3e; padding:2px 8px; border-radius:999px}
+
+.wave{
+  position:relative; height:120px; display:flex; align-items:flex-end; gap:6px; padding:10px; border-radius:12px; background:#0c1218; border:1px solid #16202d;
+  overflow:hidden; min-width:0;
+}
+.bar{
+  width:6px; height:6px;
+  background:linear-gradient(180deg, #2af7c9, #138f76);
+  border-radius:4px 4px 0 0; opacity:.95; transform-origin:bottom;
+  flex:1 1 auto; /* bars share space without overflowing due to minmax(0,1fr) parent */
+}
+.wave::after{content:""; position:absolute; inset:0; pointer-events:none; background:linear-gradient(0deg, rgba(0,0,0,.35), transparent 30%)}
+
+.footer{
+  margin-top:16px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;
+}
+.foot-left{
+  display:flex; align-items:center; gap:10px; color:#b7c3d6;
+  background: var(--panel); border:1px solid var(--border); padding:12px 14px; border-radius:14px; flex:1; min-width:0;
+}
+
+.btn{
+  display:inline-flex; align-items:center; gap:10px; border-radius:14px; padding:12px 18px; font-weight:600; border:1px solid #21443a; background:#113629; color:#baf7e7; cursor:pointer;
+  box-shadow: 0 0 0 0 rgba(31,224,176,.4); transition: box-shadow .15s ease, transform .06s ease, background .15s ease;
+  white-space:nowrap;
+}
+.btn:hover{ box-shadow: 0 0 0 6px rgba(31,224,176,.07) }
+.btn:active{ transform: translateY(1px) }
+.btn.paused{ background:#33211c; border-color:#5a2e22; color:#ffd5c5 }
+
+.sr-only{position:absolute;left:-10000px;top:auto;width:1px;height:1px;overflow:hidden}
+.mini{font-size:12px;color:#7f8ca1;margin-top:6px}
