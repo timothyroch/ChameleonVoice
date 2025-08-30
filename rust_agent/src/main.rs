@@ -483,9 +483,11 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
                 let mut out_line = line.clone();
                 if let Ok(mut node) = serde_json::from_str::<Json>(&line) {
                     if node.is_object() {
-                        if let Some(text) = node.get("text").and_then(|v| v.as_str()) {
+                        if let Some(text) = node.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                            let trimmed = text.trim();
                             if !text.trim().is_empty() {
-                                let tr = translate_text(&http, &base, text, &target).await;
+                                let skip_tts = trimmed.contains("[") || trimmed.contains("(");
+                                let tr = translate_text(&http, &base, trimmed, &target).await;
                                 if let Some(obj) = node.as_object_mut() {
 
                                         // generate audio_url for Coqui
@@ -494,6 +496,9 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
                                         // Build snapshot URL on this same server
                                         //let self_base = format!("http://127.0.0.1:{}", server_port);
                                         //let snapshot = format!("{}/speaker_snapshot", self_base);
+                                        if skip_tts {
+                                            obj.remove("audio_url");
+                                        } else {
                                         let audio_url = format!(
                                         "/tts_proxy?lang={}&text={}",
                                         target,
@@ -502,6 +507,7 @@ async fn stream_translated(app: web::Data<AppState>, cfg: web::Data<Config>, to:
                                     );
                                         obj.insert("audio_url".into(), Json::String(audio_url));
                                 }
+                            }
                                 out_line = node.to_string();
                             }
                         } else {
