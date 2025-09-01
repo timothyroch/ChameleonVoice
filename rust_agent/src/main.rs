@@ -24,6 +24,7 @@ mod config;
 mod state;
 mod multi_threads;
 mod popup;
+mod tts_playout;
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -951,6 +952,13 @@ async fn main() -> std::io::Result<()> {
     })
     .bind(("127.0.0.1", cfg.port))?
     .run();
+
+    std::thread::spawn(|| {
+    eprintln!("starting tts_playout…");
+    if let Err(e) = tts_playout::run() {
+        eprintln!("tts_playout crashed: {e:?}");
+    }
+    });
     
     // spawn popup
     let popup_url_port = cfg.port;
